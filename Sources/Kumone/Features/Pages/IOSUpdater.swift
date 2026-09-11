@@ -64,7 +64,13 @@ final class IOSUpdater: NSObject, ObservableObject {
     /// relaunches; if it is not, `open` fails and we point the user at the
     /// manual download.
     func installViaTrollStore(_ release: ReleaseChecker.Release) {
-        guard let ipaURL = release.ipaURL else {
+        // Prefer the CarPlay build: TrollStore re-signs the app with the
+        // entitlements already present in the binary, so it is the only install
+        // path where the restricted CarPlay entitlement survives. `download(_:)`
+        // deliberately keeps using `release.ipaURL` (the plain IPA) — AltStore and
+        // SideStore profiles cannot sign `com.apple.developer.carplay-audio`.
+        // Falls back to the plain IPA for releases that predate the CarPlay asset.
+        guard let ipaURL = release.carPlayIPAURL ?? release.ipaURL else {
             openReleasePage(release)
             return
         }

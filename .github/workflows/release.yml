@@ -117,6 +117,12 @@ jobs:
             MARKETING_VERSION="$VERSION" CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
             build
           APP="$RUNNER_TEMP/ios-dd/Build/Products/Release-iphoneos/KumoneIOS.app"
+          # Guard against the CarPlay overlay leaking into the plain IPA: the
+          # default config must keep UISupportsCarPlay out of the product.
+          if /usr/libexec/PlistBuddy -c 'Print :UISupportsCarPlay' "$APP/Info.plist" 2>/dev/null | grep -qx true; then
+            echo "::error::UISupportsCarPlay leaked into the plain IPA — CarPlay.local.xcconfig present?" >&2
+            exit 1
+          fi
           mkdir -p "$RUNNER_TEMP/payload/Payload"
           cp -R "$APP" "$RUNNER_TEMP/payload/Payload/"
           (cd "$RUNNER_TEMP/payload" && zip -qry "$GITHUB_WORKSPACE/dist/$APP_NAME-iOS-$VERSION.ipa" Payload)
@@ -151,4 +157,131 @@ jobs:
             --no-browse \
             --no-audit \
             owo-network/brew/kumone
+
+  # CarPlay IPA for TrollStore (巨魔). Deliberately a separate job: `configure-ios.sh
+  # --carplay` writes ios/Config/CarPlay.local.xcconfig, so it must never share a
+  # workspace with the plain-IPA steps above.
+  #
+  # `needs: release` because `gh release upload` requires the release to exist, and
+  # because the asset is added after `gh release create` the Sparkle appcast is
+  # unaffected. The CarPlay build carries the restricted com.apple.developer.carplay-audio
+  # entitlement baked into the binary with ldid — kept by TrollStore on install — so it
+  # must NOT be offered to AltStore / SideStore users, whose profiles cannot sign it.
+  # `make configure` (or `Scripts/configure-ios.sh` without flags) returns to the default,
+  # CarPlay-free build.
+  ios-carplay-ipa:
+    needs: release
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # build number = commit count; must match the plain IPA
+
+      - name: Derive version
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "BUILD_NUMBER=$(git rev-list --count HEAD)" >> "$GITHUB_ENV"
+
+      - name: Install ldid
+        run: |
+          # homebrew-core has `ldid` (saurik) and `ldid-procursus` (ProcursusTeam) and
+          # they conflict_with each other — install exactly one. Procursus is the same
+          # lineage as the ldid TrollStore runs on-device and carries the entitlements
+          # memory fix (ProcursusTeam/ldid#34).
+          brew install ldid-procursus
+          ldid -h | head -1
+
+      - name: Turn on the CarPlay overlay
+        run: |
+          Scripts/configure-ios.sh --carplay
+          cat ios/Config/CarPlay.local.xcconfig
+          /usr/libexec/PlistBuddy -c "Print :com.apple.developer.carplay-audio" \
+            ios/Config/Generated/KumoneIOS-CarPlay.entitlements
+
+      - name: Show effective build settings (diagnostic)
+        run: |
+          xcodebuild -workspace ios/KumoneIOS.xcworkspace -scheme KumoneIOS \
+            -configuration Release -destination 'generic/platform=iOS' \
+            -showBuildSettings 2>/dev/null |
+            grep -E '^ +(INFOPLIST_FILE|CODE_SIGN_ENTITLEMENTS|PRODUCT_BUNDLE_IDENTIFIER|PRODUCT_MODULE_NAME|DEVELOPMENT_TEAM|CODE_SIGN_IDENTITY|CODE_SIGNING_ALLOWED) =' \
+            || true
+
+      - name: Build unsigned iOS app (CarPlay overlay)
+        run: |
+          xcodebuild -workspace ios/KumoneIOS.xcworkspace -scheme KumoneIOS \
+            -configuration Release -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/ios-dd" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            INFOPLIST_EXPAND_BUILD_SETTINGS=YES \
+            MARKETING_VERSION="$VERSION" CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
+            build
+
+      - name: Assert the overlay reached the product
+        run: |
+          set -euo pipefail
+          APP="$RUNNER_TEMP/ios-dd/Build/Products/Release-iphoneos/KumoneIOS.app"
+          PLIST="$APP/Info.plist"
+          BIN="$APP/KumoneIOS"
+          fail() { echo "::error::$1"; exit 1; }
+
+          [ -x "$BIN" ] || fail "no executable at $BIN"
+          [ "$(/usr/libexec/PlistBuddy -c 'Print :UISupportsCarPlay' "$PLIST" 2>/dev/null || true)" = "true" ] \
+            || fail "UISupportsCarPlay missing — CarPlay.local.xcconfig was not picked up"
+          DELEGATE="$(/usr/libexec/PlistBuddy -c 'Print :UIApplicationSceneManifest:UISceneConfigurations:CPTemplateApplicationSceneSessionRoleApplication:0:UISceneDelegateClassName' "$PLIST" 2>/dev/null || true)"
+          [ "$DELEGATE" = "KumoneIOS.CarPlaySceneDelegate" ] \
+            || fail "CarPlay scene delegate is '$DELEGATE', expected 'KumoneIOS.CarPlaySceneDelegate'"
+          [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$PLIST")" = "sb.moe.kumone" ] || fail "wrong bundle id"
+          [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PLIST")" = "$VERSION" ] || fail "wrong version"
+          [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$PLIST")" = "$BUILD_NUMBER" ] || fail "wrong build number"
+          [ "$(lipo -archs "$BIN")" = "arm64" ] || fail "unexpected archs: $(lipo -archs "$BIN")"
+
+      - name: Inject com.apple.developer.carplay-audio with ldid
+        run: |
+          set -euo pipefail
+          APP="$RUNNER_TEMP/ios-dd/Build/Products/Release-iphoneos/KumoneIOS.app"
+          BIN="$APP/KumoneIOS"
+          ENT="ios/Config/Generated/KumoneIOS-CarPlay.entitlements"
+
+          # -S takes its argument ATTACHED (getopt optional-arg): `-S"$ENT"`, never
+          # `-S "$ENT"`. With a space, ldid pseudo-signs with NO entitlements and then
+          # treats the plist as a second file to sign.
+          ldid "-S$ENT" "$BIN"
+
+          # Read them back the way TrollStore will (kSecCodeInfoEntitlementsDict over
+          # the CSSLOT_ENTITLEMENTS blob).
+          ldid -e "$BIN" > "$RUNNER_TEMP/ents.plist"
+          cat "$RUNNER_TEMP/ents.plist"
+          /usr/libexec/PlistBuddy -c 'Print :com.apple.developer.carplay-audio' "$RUNNER_TEMP/ents.plist" \
+            | grep -qx true || { echo "::error::carplay-audio is not in the signed binary"; exit 1; }
+
+          # Diagnostics only — never fail the job on these.
+          codesign -d --entitlements :- "$BIN" 2>&1 | head -30 || true
+          ldid -h "$BIN" | head -5 || true
+
+      - name: Package IPA
+        run: |
+          set -euo pipefail
+          APP="$RUNNER_TEMP/ios-dd/Build/Products/Release-iphoneos/KumoneIOS.app"
+          IPA="$GITHUB_WORKSPACE/dist/$APP_NAME-iOS-CarPlay-$VERSION.ipa"
+          mkdir -p "$RUNNER_TEMP/payload/Payload" dist
+          cp -R "$APP" "$RUNNER_TEMP/payload/Payload/"
+          (cd "$RUNNER_TEMP/payload" && zip -qry "$IPA" Payload)
+
+          unzip -Z1 "$IPA" > "$RUNNER_TEMP/ipa-contents.txt"
+          cat "$RUNNER_TEMP/ipa-contents.txt"
+          grep -qx 'Payload/KumoneIOS.app/KumoneIOS' "$RUNNER_TEMP/ipa-contents.txt"
+          # TrollStore installs exactly one bundle per IPA.
+          [ "$(grep -cE '^Payload/[^/]+\.app/$' "$RUNNER_TEMP/ipa-contents.txt")" -eq 1 ]
+          # We signed the main binary only; a bundle signature must not appear.
+          ! grep -q '_CodeSignature' "$RUNNER_TEMP/ipa-contents.txt"
+
+      - name: Attach the CarPlay IPA to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$GITHUB_REF_NAME" \
+            "dist/$APP_NAME-iOS-CarPlay-$VERSION.ipa" \
+            --clobber
 
