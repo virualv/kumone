@@ -6,17 +6,21 @@
 section the English bullets come first, followed by their Simplified Chinese
 counterparts. 段落格式：`## <版本号> - <日期>`，条目必须写成单行。
 
-## 0.3.18 - 2026-09-10
+## 0.4.0 - 2026-09-11
 
 ### Added / 新增
 
 - **macOS**: an ambient background behind the main window derived from the current track's artwork — a soft color wash plus a subtle titlebar tint that follows the playing song. On by default; toggle it off or adjust the intensity in Settings. Thanks @yamakze (#86).
-- **macOS**：主窗口新增取自当前封面的氛围背景——柔和的色彩铺底 + 淡淡的标题栏染色，随播放歌曲变化。默认开启,可在设置里关闭或调节强度。感谢 @yamakze（#86）。
+- **macOS**：主窗口新增取自当前封面的氛围背景——柔和的色彩铺底 + 淡淡的标题栏染色，随播放歌曲变化。默认开启，可在设置里关闭或调节强度。感谢 @yamakze（#86）。
+- **iOS**: every release now ships a second, CarPlay-enabled IPA (`Kumone-iOS-CarPlay-X.Y.Z.ipa`) alongside the plain one, built by CI with `make configure-carplay` and pseudo-signed with ldid so the restricted `com.apple.developer.carplay-audio` entitlement is baked into the binary. TrollStore (巨魔) keeps those entitlements when it installs, so the in-app updater now hands TrollStore this build; AltStore / SideStore / Sideloadly keep using the plain IPA, whose profiles cannot sign that entitlement.
+- **iOS**：每个版本现在在普通 IPA 之外额外发布一个开启 CarPlay 的 `Kumone-iOS-CarPlay-X.Y.Z.ipa`——由 CI 用 `make configure-carplay` 构建并经 ldid 伪签名，把受限的 `com.apple.developer.carplay-audio` entitlement 直接写入二进制。TrollStore（巨魔）安装时会保留这些 entitlement，因此应用内更新现在会把这一版交给 TrollStore；AltStore / SideStore / 全能签等继续使用普通 IPA（它们的描述文件无法签署该 entitlement）。
 
 ### Fixed / 修复
 
 - **macOS**: the toolbar search field and the floating player bar now keep more clearance from the window's rounded corners, so their capsules no longer nearly touch the window edges and the inner/outer corner radii stop visually merging. (#88)
-- **macOS**：工具栏搜索框与悬浮播放条现在与窗口圆角保持更多间距,不再几乎贴住窗口边缘,内外圆角也不再互相干扰。（#88）
+- **macOS**：工具栏搜索框与悬浮播放条现在与窗口圆角保持更多间距，不再几乎贴住窗口边缘，内外圆角也不再互相干扰。（#88）
+- **macOS**: under macOS 26 (Liquid Glass) the custom capsule search field no longer picks up a second background — the `sharedBackgroundVisibility(.hidden)` availability branch dropped by the ambient-background rewrite is restored. (#86)
+- **macOS**：macOS 26（Liquid Glass）下自定义胶囊搜索框不再出现第二层背景——氛围背景重构中丢失的 `sharedBackgroundVisibility(.hidden)` 可用性分支已恢复。（#86）
 
 ## 0.3.17 - 2026-09-10
 
