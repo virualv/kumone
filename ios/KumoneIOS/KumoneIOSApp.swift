@@ -21,6 +21,18 @@ import UIKit
 final class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegate {}
 
 extension CarPlaySceneDelegate {
+    /// Records that CarPlay actually created the scene. If `carplay.log` on the device has
+    /// no line for this, iOS never handed the app a CarPlay session — the car screen is
+    /// black because the app was never asked to draw anything, not because a template
+    /// failed.
+    func scene(
+        _ scene: UIScene,
+        willConnectTo session: UISceneSession,
+        options connectionOptions: UIScene.ConnectionOptions
+    ) {
+        CarPlayDiagnostics.record("scene willConnect: role=\(session.role.rawValue)")
+    }
+
     func templateApplicationScene(
         _ scene: CPTemplateApplicationScene,
         didConnect interfaceController: CPInterfaceController

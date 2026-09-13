@@ -41,10 +41,20 @@ public final class CarPlayConnector: NSObject {
 
     // MARK: - Lifecycle
 
-    /// Called when the CarPlay scene connects. Builds the root template and kicks off data loading.
+    /// Called when the CarPlay scene connects. Presents the root template, then kicks off data loading.
     public func didConnect(interfaceController: CPInterfaceController, window: CPWindow) {
+        CarPlayDiagnostics.record("didConnect: CarPlay scene connected")
         self.interfaceController = interfaceController
         cancellables.removeAll()
+
+        // Present the root template BEFORE anything else. CarPlay shows a black
+        // screen until a root template is presented, and everything below this
+        // point can take a while on the main thread — `PlayerService` activation
+        // in particular activates the audio session, which can stall until the
+        // CarPlay audio route is up. Painting first means the tabs appear as soon
+        // as the session connects, and a presentation failure is recorded with a
+        // readable fallback instead of leaving the screen black.
+        installRootTemplate()
 
         // Force PlayerService to initialize (sets up the audio session and remote commands).
         _ = PlayerService.shared
@@ -132,12 +142,9 @@ public final class CarPlayConnector: NSObject {
             .store(in: &cancellables)
 
         // Configure the Now Playing buttons (persistent — live for the singleton's lifetime).
+        // Deliberately after installRootTemplate(): CarPlay only routes the system Now
+        // Playing screen to an app that already has a presented root template.
         configureNowPlayingButtons()
-
-        // Build and install the root template.
-        let root = makeRootTemplate()
-        tabBar = root
-        interfaceController.setRootTemplate(root, animated: true, completion: nil)
 
         // On cold start, finish account bootstrap first, then load all four tabs in their final logged-in/out state.
         scheduleFullReload(bootstrapIfNeeded: true)
@@ -145,6 +152,7 @@ public final class CarPlayConnector: NSObject {
 
     /// Called when the CarPlay scene disconnects. Clears template references but doesn't stop playback.
     public func didDisconnect() {
+        CarPlayDiagnostics.record("didDisconnect: CarPlay scene disconnected")
         CPNowPlayingTemplate.shared.remove(self)
         cancellables.removeAll()
         loadGeneration += 1
@@ -160,8 +168,11 @@ public final class CarPlayConnector: NSObject {
 
     // MARK: - Root template
 
-    /// Builds the CPTabBarTemplate (Recommend / Curated / Roaming / Library) — mirrors the App's IOSTab layout 1:1.
-    private func makeRootTemplate() -> CPTabBarTemplate {
+    /// The four tab templates, in tab order — mirrors the App's IOSTab layout 1:1.
+    ///
+    /// `CPNowPlayingTemplate` is deliberately absent: CarPlay auto-presents it whenever
+    /// audio plays, and it cannot be a `CPTabBarTemplate` tab.
+    private func makeTabTemplates() -> [CPListTemplate] {
         let recommend = CPListTemplate(title: "推荐", sections: [])
         recommend.tabImage = UIImage(systemName: "house")
         recommend.emptyViewTitleVariants = ["正在加载推荐…"]
@@ -183,8 +194,51 @@ public final class CarPlayConnector: NSObject {
         self.fmTab = fm
         self.libraryTab = library
 
-        // CPNowPlayingTemplate is auto-presented by CarPlay whenever audio plays; it can't be added as a CPTabBarTemplate tab.
-        return CPTabBarTemplate(templates: [recommend, curated, fm, library])
+        return [recommend, curated, fm, library]
+    }
+
+    /// Presents the tab bar as the root template and records what CarPlay did with it.
+    ///
+    /// Two guards, both against a car screen that stays black for the whole session:
+    /// - The tab count is clamped to `CPTabBarTemplate.maximumTabCount`. CarPlay derives
+    ///   that value from the app's entitlements (4 while the process carries
+    ///   `com.apple.developer.carplay-audio`, 5 otherwise) and throws when it is exceeded;
+    ///   Swift cannot catch that exception, so exceeding it must be impossible.
+    /// - Presentation failures are taken from the completion block — the `completion: nil`
+    ///   form turns exactly the same failure into an uncatchable throw — and answered with
+    ///   a readable fallback template instead of black.
+    private func installRootTemplate() {
+        guard let interfaceController else {
+            CarPlayDiagnostics.record("installRootTemplate: no interface controller")
+            return
+        }
+
+        let tabs = makeTabTemplates()
+        let limit = max(1, CPTabBarTemplate.maximumTabCount)
+        CarPlayDiagnostics.record("installRootTemplate: \(tabs.count) tabs, CarPlay limit \(limit)")
+
+        let root = CPTabBarTemplate(templates: Array(tabs.prefix(limit)))
+        tabBar = root
+
+        interfaceController.setRootTemplate(root, animated: true) { [weak self] success, error in
+            guard let self else { return }
+            if success {
+                CarPlayDiagnostics.record("installRootTemplate: root template presented")
+            } else {
+                let reason = error?.localizedDescription ?? "unknown error"
+                CarPlayDiagnostics.record("installRootTemplate: FAILED — \(reason)")
+                self.presentFallbackTemplate(reason: reason)
+            }
+        }
+    }
+
+    /// Last-resort root template: an explanation on the car screen beats an empty one.
+    private func presentFallbackTemplate(reason: String) {
+        guard let interfaceController else { return }
+        let item = CPListItem(text: "CarPlay 界面加载失败", detailText: reason)
+        let template = CPListTemplate(title: "Kumone", sections: [CPListSection(items: [item])])
+        interfaceController.setRootTemplate(template, animated: false, completion: nil)
+        CarPlayDiagnostics.record("presentFallbackTemplate: fallback presented")
     }
 
     // MARK: - Now Playing button configuration

@@ -6,6 +6,25 @@
 section the English bullets come first, followed by their Simplified Chinese
 counterparts. 段落格式：`## <版本号> - <日期>`，条目必须写成单行。
 
+## 0.4.1 - 2026-09-13
+
+### Added / 新增
+
+- **iOS**: the CarPlay build now writes `carplay.log` into the app's Documents folder (Files ▸ On My iPhone ▸ Kumone) recording how far a car session got — scene created, `didConnect` reached, the tab limit CarPlay reported, and whether the root template was accepted. A black car screen produces no crash report and a TrollStore install cannot be attached to Xcode for a console, so this log is the only way to tell "CarPlay never handed us a scene" apart from "we never presented a template".
+- **iOS**：CarPlay 构建会把 `carplay.log` 写入 App 的 Documents 目录（「文件」▸ 我的 iPhone ▸ Kumone），记录车机会话走到了哪一步——scene 是否建立、`didConnect` 是否执行、CarPlay 报告的 tab 上限、根模板是否被接受。车机黑屏不会产生崩溃报告，巨魔版也无法连 Xcode 看控制台，因此该日志是区分「CarPlay 从未给我们 scene」与「我们从未呈现模板」的唯一手段。
+
+### Fixed / 修复
+
+- **iOS**: the CarPlay IPA's `com.apple.developer.carplay-audio` entitlement is now written with `codesign` rather than `ldid`. ldid emits an entitlements blob that Security.framework rejects (`binary contains an invalid entitlements blob. The OS will ignore these entitlements.`), so TrollStore's installer read no entitlements and re-signed the app with its own fallback set, silently dropping the entitlement: the app appeared in CarPlay but could not work as a CarPlay app. `ldid -e` reads that blob back regardless, which is why the previous check reported success.
+- **iOS**：CarPlay IPA 的 `com.apple.developer.carplay-audio` entitlement 改用 `codesign` 写入（此前为 `ldid`）。ldid 写出的 entitlements blob 会被 Security.framework 拒绝（`binary contains an invalid entitlements blob. The OS will ignore these entitlements.`），巨魔安装时因此读不到任何 entitlement、改用它自带的默认集合重签，这个 entitlement 被静默丢弃：应用能出现在 CarPlay 列表里，却无法作为 CarPlay 应用工作。`ldid -e` 无论如何都能读回该 blob，这正是旧检查误报通过的原因。
+- **iOS**: the CarPlay session now presents its root template before any slow work (audio-session activation included) and no longer submits it through the `completion: nil` form of `setRootTemplate` — CarPlay turns a failed presentation into an exception Swift cannot catch, and until a root template is presented the car screen stays black for the entire session. The tab count is clamped to `CPTabBarTemplate.maximumTabCount` (4 with the audio entitlement, 5 without), which CarPlay enforces by throwing, and a failed presentation now falls back to a template stating the error instead of an empty screen.
+- **iOS**：CarPlay 会话现在**先呈现根模板**、再执行其余耗时工作（含音频会话激活），且不再通过 `setRootTemplate` 的 `completion: nil` 形式提交——CarPlay 会把呈现失败变成 Swift 无法捕获的异常，而在根模板呈现之前车机屏幕整场都是黑的。tab 数已钳制到 `CPTabBarTemplate.maximumTabCount`（有音频 entitlement 为 4、无则为 5，超限 CarPlay 直接抛异常），呈现失败时退回到写明错误信息的模板，而不是留一片空白。
+
+### Improved / 改进
+
+- **Build**: the release workflow now asserts that the CarPlay scene delegate class is present in the binary. An Info.plist naming a class that was stripped, renamed or never linked still satisfies every plist-level check, and the car screen then opens to black.
+- **Build**：发布流程新增断言：CarPlay scene delegate 类必须真实存在于二进制中。若 Info.plist 指向的类被裁剪、改名或未链接，所有 plist 层检查依然通过，而车机端会黑屏。
+
 ## 0.4.0 - 2026-09-11
 
 ### Added / 新增

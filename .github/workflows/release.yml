@@ -3,6 +3,14 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  # Manual runs build the exact same CarPlay IPA and upload it as a workflow
+  # artifact, so a TrollStore device can be tested without cutting a tag.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version used for the IPA filename (manual runs only)
+        required: false
+        default: "0.0.0-dev"
 
 permissions:
   contents: write
@@ -20,39 +28,112 @@ jobs:
 
       - name: Derive version
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="${{ inputs.version }}"
+          fi
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           echo "BUILD_NUMBER=$(git rev-list --count HEAD)" >> "$GITHUB_ENV"
 
       - name: Extract release notes from CHANGELOG.md
+        if: github.ref_type == 'tag'
         run: |
           Scripts/release-notes.sh "$VERSION" > "$RUNNER_TEMP/notes.md"
           echo "Release notes for $VERSION:"
           cat "$RUNNER_TEMP/notes.md"
 
-      - name: Build unsigned iOS IPA (CarPlay)
+      - name: Turn on the CarPlay overlay
         run: |
-          # CarPlay overlay (entitlement + scene manifest + UISupportsCarPlay)
-          # is one-command opt-in; the release artifact is the CarPlay build.
-          make configure-carplay
+          Scripts/configure-ios.sh --carplay
+          cat ios/Config/CarPlay.local.xcconfig
+
+      - name: Build unsigned iOS app (CarPlay overlay)
+        run: |
           xcodebuild -workspace ios/KumoneIOS.xcworkspace -scheme KumoneIOS \
             -configuration Release -destination 'generic/platform=iOS' \
             -derivedDataPath "$RUNNER_TEMP/ios-dd" \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            INFOPLIST_EXPAND_BUILD_SETTINGS=YES \
             MARKETING_VERSION="$VERSION" CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
             build
+
+      - name: Assert the overlay reached the product
+        run: |
+          set -euo pipefail
           APP="$RUNNER_TEMP/ios-dd/Build/Products/Release-iphoneos/KumoneIOS.app"
-          mkdir -p dist
-          mkdir -p "$RUNNER_TEMP/payload/Payload"
+          PLIST="$APP/Info.plist"
+          BIN="$APP/KumoneIOS"
+          fail() { echo "::error::$1"; exit 1; }
+
+          [ -x "$BIN" ] || fail "no executable at $BIN"
+          [ "$(/usr/libexec/PlistBuddy -c 'Print :UISupportsCarPlay' "$PLIST" 2>/dev/null || true)" = "true" ] \
+            || fail "UISupportsCarPlay missing — CarPlay.local.xcconfig was not picked up"
+          DELEGATE="$(/usr/libexec/PlistBuddy -c 'Print :UIApplicationSceneManifest:UISceneConfigurations:CPTemplateApplicationSceneSessionRoleApplication:0:UISceneDelegateClassName' "$PLIST" 2>/dev/null || true)"
+          [ "$DELEGATE" = "KumoneIOS.CarPlaySceneDelegate" ] \
+            || fail "CarPlay scene delegate is '$DELEGATE', expected 'KumoneIOS.CarPlaySceneDelegate'"
+          [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$PLIST")" = "sb.moe.kumone" ] || fail "wrong bundle id"
+          [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PLIST")" = "$VERSION" ] || fail "wrong version"
+          [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$PLIST")" = "$BUILD_NUMBER" ] || fail "wrong build number"
+
+          # The class the manifest names must actually exist in the binary. An
+          # Info.plist that points at a class which was stripped, renamed or never
+          # linked still satisfies every plist-level assertion above, and the car
+          # screen then shows the app icon and a permanently black screen — the
+          # failure mode this build is most expensive to discover in the field.
+          nm -m "$BIN" 2>/dev/null | grep -q 'CarPlaySceneDelegate' \
+            || fail "CarPlaySceneDelegate is missing from $BIN — CarPlay would open to a black screen"
+
+      - name: Bake com.apple.developer.carplay-audio with codesign
+        run: |
+          set -euo pipefail
+          APP="$RUNNER_TEMP/ios-dd/Build/Products/Release-iphoneos/KumoneIOS.app"
+          ENT="ios/Config/Generated/KumoneIOS-CarPlay.entitlements"
+
+          # codesign, NOT ldid. ldid -S<plist> writes an entitlements blob that
+          # Security.framework rejects ("binary contains an invalid entitlements
+          # blob. The OS will ignore these entitlements."), so TrollStore's
+          # dumpEntitlements() reads nil during install and re-signs with its
+          # fallback set — silently dropping carplay-audio, which keeps the app
+          # out of CarPlay. `ldid -e` reads the blob back regardless, so it cannot
+          # be used to verify this. codesign's adhoc signature stays readable.
+          codesign --force --sign - --entitlements "$ENT" "$APP"
+          codesign -dv "$APP" 2>&1 | grep -E 'Identifier|Signature|Format' || true
+          codesign -d --entitlements :- "$APP/KumoneIOS" 2>&1 | grep -v deprecated || true
+
+      - name: Assert TrollStore will preserve the entitlement
+        run: |
+          # Reads the entitlement through the same Security.framework call
+          # TrollStore's installer uses; fails the release otherwise.
+          swift Scripts/carplay-entitlement-probe.swift \
+            "$RUNNER_TEMP/ios-dd/Build/Products/Release-iphoneos/KumoneIOS.app"
+
+      - name: Package IPA
+        run: |
+          set -euo pipefail
+          APP="$RUNNER_TEMP/ios-dd/Build/Products/Release-iphoneos/KumoneIOS.app"
+          IPA="$GITHUB_WORKSPACE/dist/$APP_NAME-iOS-CarPlay-$VERSION.ipa"
+          mkdir -p "$RUNNER_TEMP/payload/Payload" dist
           cp -R "$APP" "$RUNNER_TEMP/payload/Payload/"
-          (cd "$RUNNER_TEMP/payload" && zip -qry "$GITHUB_WORKSPACE/dist/$APP_NAME-iOS-$VERSION.ipa" Payload)
+          (cd "$RUNNER_TEMP/payload" && zip -qry "$IPA" Payload)
+          # Re-assert on the artifact users actually download: the entitlement has
+          # to survive the zip round trip as bytes, not just in the build product.
+          swift Scripts/carplay-entitlement-probe.swift "$IPA"
           ls -la dist/
 
-      - name: Create GitHub release
+      - name: Publish GitHub release
+        if: github.ref_type == 'tag'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" \
             --title "$APP_NAME $VERSION" \
             --notes-file "$RUNNER_TEMP/notes.md" \
-            "dist/$APP_NAME-iOS-$VERSION.ipa"
+            "dist/$APP_NAME-iOS-CarPlay-$VERSION.ipa"
+
+      - name: Upload IPA artifact (manual runs)
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}-iOS-CarPlay-${{ env.VERSION }}
+          path: dist/*.ipa
