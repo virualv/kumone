@@ -76,18 +76,28 @@ jobs:
           [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PLIST")" = "$VERSION" ] || fail "wrong version"
           [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$PLIST")" = "$BUILD_NUMBER" ] || fail "wrong build number"
 
-          # The class the manifest names must actually exist in the binary. An
+          # The class the manifest names must exist in the shipped binaries. An
           # Info.plist that points at a class which was stripped, renamed or never
           # linked still satisfies every plist-level assertion above, and the car
           # screen then shows the app icon and a permanently black screen — the
           # failure mode this build is most expensive to discover in the field.
           #
-          # Grep the file directly rather than piping `nm` into `grep -q`: under
+          # Check Mach-O binaries only, never Info.plist: the manifest contains the
+          # delegate class name precisely because it declares it, so searching the
+          # bundle at large would satisfy this check with the very declaration under
+          # test. Grep the files rather than piping `nm` into `grep -q`: under
           # `set -o pipefail`, `grep -q` exiting on its first match sends SIGPIPE to
-          # `nm`, which fails the whole pipeline even though the symbol was found.
-          # The class name string also survives symbol stripping, where `nm` does not.
-          grep -aq 'CarPlaySceneDelegate' "$BIN" \
-            || fail "CarPlaySceneDelegate is missing from $BIN — CarPlay would open to a black screen"
+          # `nm`, which fails the pipeline even though the symbol was found. The
+          # class name also survives symbol stripping, where `nm` does not.
+          BINARIES=("$BIN")
+          for dylib in "$APP"/*.dylib; do
+            [ -e "$dylib" ] && BINARIES+=("$dylib")
+          done
+          if grep -qa 'CarPlaySceneDelegate' "${BINARIES[@]}"; then
+            echo "CarPlay scene delegate: present in ${BINARIES[*]}"
+          else
+            fail "CarPlaySceneDelegate is missing from ${BINARIES[*]} — CarPlay would open to a black screen"
+          fi
 
       - name: Bake com.apple.developer.carplay-audio with codesign
         run: |
