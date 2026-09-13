@@ -81,7 +81,12 @@ jobs:
           # linked still satisfies every plist-level assertion above, and the car
           # screen then shows the app icon and a permanently black screen — the
           # failure mode this build is most expensive to discover in the field.
-          nm -m "$BIN" 2>/dev/null | grep -q 'CarPlaySceneDelegate' \
+          #
+          # Grep the file directly rather than piping `nm` into `grep -q`: under
+          # `set -o pipefail`, `grep -q` exiting on its first match sends SIGPIPE to
+          # `nm`, which fails the whole pipeline even though the symbol was found.
+          # The class name string also survives symbol stripping, where `nm` does not.
+          grep -aq 'CarPlaySceneDelegate' "$BIN" \
             || fail "CarPlaySceneDelegate is missing from $BIN — CarPlay would open to a black screen"
 
       - name: Bake com.apple.developer.carplay-audio with codesign
